@@ -3,34 +3,33 @@
 # ==============================================================================
 # Node Exporter Installer & Uninstaller
 #
-# This script installs or removes the Prometheus Node Exporter on systems
-# using systemd and apt, dnf, or yum package managers.
+# This script installs or removes the Prometheus Node Exporter. It automatically
+# detects the platform architecture, prompts to install missing dependencies, and
+# allows for customization of the user, group, and port.
 #
 # Usage:
-#   sudo ./script.sh --install
-#   sudo ./script.sh --remove
-#   ./script.sh --help
+#   sudo ./install_node_exporter.sh --install
+#   sudo ./install_node_exporter.sh --install --port 9900 --user custom_user
+#   sudo ./install_node_exporter.sh --remove
+#   ./install_node_exporter.sh --help
 # ==============================================================================
 
 # --- Strict Mode & Error Handling ---
-# -e: exit immediately if a command exits with a non-zero status.
-# -u: treat unset variables as an error.
-# -o pipefail: the return value of a pipeline is the status of the last command
-#              to exit with a non-zero status, or zero if no command exited
-#              with a non-zero status.
 set -euo pipefail
 
-# --- Configuration Variables (readonly) ---
-readonly SERVICE_USER="node_exporter"
-readonly SERVICE_GROUP="node_exporter"
+# --- Default Configuration Variables (can be overridden by arguments) ---
+SERVICE_USER="node_exporter"
+SERVICE_GROUP="node_exporter"
+DATA_PORT="9100"
+
+# --- Static Configuration Variables ---
 readonly BINARY_PATH="/usr/local/bin/node_exporter"
-readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_USER}.service"
-readonly DATA_PORT="9100"
-readonly ARCH="amd64" # Change if you are on a different architecture
+
+# --- Dynamic Platform Variables (set at runtime) ---
+PLATFORM_ARCH=""
+SERVICE_FILE=""
 
 # --- Color & Formatting Variables ---
-# \e[...m is the escape sequence for colors.
-# tput is used to ensure compatibility.
 readonly COLOR_GREEN=$(tput setaf 2)
 readonly COLOR_YELLOW=$(tput setaf 3)
 readonly COLOR_RED=$(tput setaf 1)
@@ -38,28 +37,21 @@ readonly COLOR_RESET=$(tput sgr0)
 readonly BOLD=$(tput bold)
 
 # --- Logging Functions ---
-# msg() is a general-purpose logging function.
 msg() {
     echo >&2 -e "${1-}"
 }
-
-# success(), notice(), and fatal() are helpers for different log levels.
 success() {
     msg "${COLOR_GREEN}✅ ${BOLD}SUCCESS:${COLOR_RESET} ${1}"
 }
-
 notice() {
     msg "${COLOR_YELLOW}⚠️  ${BOLD}NOTICE:${COLOR_RESET} ${1}"
 }
-
 fatal() {
     msg "${COLOR_RED}❌ ${BOLD}FATAL:${COLOR_RESET} ${1}"
     exit 1
 }
 
 # --- SCRIPT SETUP ---
-# Create a temporary directory that will be cleaned up automatically on exit.
-# The 'trap' command sets up a cleanup action for the EXIT signal.
 TMPDIR=$(mktemp -d)
 trap 'msg "\n--- Cleaning up temporary files ---"; rm -rf "$TMPDIR"' EXIT
 
@@ -67,14 +59,46 @@ trap 'msg "\n--- Cleaning up temporary files ---"; rm -rf "$TMPDIR"' EXIT
 # --- HELPER FUNCTIONS ---
 #==============================================================================
 
-# --- Check if the script is run as root ---
+detect_platform_arch() {
+    msg "--- Detecting platform architecture ---"
+    local os
+    local arch
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    arch=$(uname -m)
+
+    case "$os" in
+        linux)
+            if [[ "$arch" == "x86_64" ]]; then
+                PLATFORM_ARCH="linux-amd64"
+            else
+                fatal "Unsupported Linux architecture: '${arch}'. This script currently only supports amd64 (x86_64) on Linux."
+            fi
+            ;;
+        darwin)
+            # The installation steps will fail on Darwin, but we detect it as requested.
+            notice "Detected macOS (Darwin). This script's install/remove functions are for Linux (systemd) only."
+            if [[ "$arch" == "x86_64" ]]; then
+                PLATFORM_ARCH="darwin-amd64"
+            elif [[ "$arch" == "arm64" ]]; then
+                PLATFORM_ARCH="darwin-arm64"
+            else
+                fatal "Unsupported Darwin (macOS) architecture: '${arch}'."
+            fi
+            fatal "Platform '${PLATFORM_ARCH}' detected, but installation is not supported on macOS."
+            ;;
+        *)
+            fatal "Unsupported operating system: '${os}'."
+            ;;
+    esac
+    success "Platform detected: ${PLATFORM_ARCH}"
+}
+
 check_root() {
     if [[ "${EUID}" -ne 0 ]]; then
-        fatal "This script must be run as root or with sudo."
+        fatal "This script must be run as root or with sudo for install/remove operations."
     fi
 }
 
-# --- Check for required command-line tools ---
 check_dependencies() {
     msg "--- Checking for required packages ---"
     local missing_packages=()
@@ -87,14 +111,39 @@ check_dependencies() {
     done
 
     if [[ ${#missing_packages[@]} -gt 0 ]]; then
-        fatal "Missing required packages: ${missing_packages[*]}. Please install them and rerun the script."
+        notice "Missing required packages: ${missing_packages[*]}"
+        
+        local pm
+        local install_cmd
+        if command -v apt-get &>/dev/null; then
+            pm="apt"
+            install_cmd="sudo apt-get install -y"
+        elif command -v dnf &>/dev/null; then
+            pm="dnf"
+            install_cmd="sudo dnf install -y"
+        elif command -v yum &>/dev/null; then
+            pm="yum"
+            install_cmd="sudo yum install -y"
+        else
+            fatal "Could not find a supported package manager (apt, dnf, yum). Please install the missing packages manually."
+        fi
+
+        read -p "Do you want to try and install them now using ${pm}? (y/N) " -n 1 -r REPLY
+        echo # Move to a new line
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+            msg "--- Attempting to install missing packages... ---"
+            if ! $install_cmd "${missing_packages[@]}"; then
+                 fatal "Failed to install dependencies. Please install them manually and rerun the script."
+            fi
+            success "Dependencies installed successfully."
+        else
+            fatal "User declined to install dependencies. Exiting."
+        fi
     fi
-    msg "✅ All required packages are installed."
 }
 
-# --- Create system user and group ---
 setup_user_and_group() {
-    msg "--- Creating user and group '${SERVICE_USER}' ---"
+    msg "--- Creating user '${SERVICE_USER}' and group '${SERVICE_GROUP}' ---"
     if ! getent group "$SERVICE_GROUP" >/dev/null; then
         groupadd --system "$SERVICE_GROUP"
     fi
@@ -105,16 +154,15 @@ setup_user_and_group() {
     fi
 }
 
-# --- Download and install the binary ---
 download_and_install_binary() {
-    msg "--- Downloading and installing Node Exporter ---"
+    msg "--- Downloading and installing Node Exporter for ${PLATFORM_ARCH} ---"
     cd "$TMPDIR"
 
     local latest_url
-    latest_url=$(curl -s "https://api.github.com/repos/prometheus/node_exporter/releases/latest" | jq -r ".assets[] | select(.name | contains(\"linux-${ARCH}.tar.gz\")) | .browser_download_url")
+    latest_url=$(curl -s "https://api.github.com/repos/prometheus/node_exporter/releases/latest" | jq -r ".assets[] | select(.name | contains(\"${PLATFORM_ARCH}.tar.gz\")) | .browser_download_url")
 
     if [[ -z "$latest_url" ]]; then
-        fatal "Could not automatically find the download URL for arch '${ARCH}'."
+        fatal "Could not automatically find the download URL for platform '${PLATFORM_ARCH}'."
     fi
 
     msg "--- Latest version found: ${latest_url} ---"
@@ -127,17 +175,14 @@ download_and_install_binary() {
     local extracted_dir
     extracted_dir=${tar_file%.tar.gz}
 
-    # The 'install' command is preferred over 'mv' as it can set ownership and permissions in one step.
     install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0755 "${extracted_dir}/node_exporter" "${BINARY_PATH}"
 }
 
-# --- Create the systemd service file ---
 create_systemd_service() {
-    msg "--- Creating systemd service file ---"
-    # Using a HEREDOC to write the service file configuration.
+    msg "--- Creating systemd service file: ${SERVICE_FILE} ---"
     cat <<EOF > "$SERVICE_FILE"
 [Unit]
-Description=Prometheus Node Exporter
+Description=Prometheus Node Exporter (user: ${SERVICE_USER})
 Wants=network-online.target
 After=network-online.target
 
@@ -145,7 +190,7 @@ After=network-online.target
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 Type=simple
-ExecStart=${BINARY_PATH}
+ExecStart=${BINARY_PATH} --web.listen-address=:${DATA_PORT}
 Restart=on-failure
 RestartSec=5s
 
@@ -154,7 +199,6 @@ WantedBy=multi-user.target
 EOF
 }
 
-# --- Configure the firewall ---
 setup_firewall() {
     msg "--- Configuring firewall ---"
     if systemctl is-active --quiet firewalld; then
@@ -166,7 +210,6 @@ setup_firewall() {
         ufw allow "${DATA_PORT}/tcp" >/dev/null
     else
         notice "No active firewall (firewalld/ufw) detected. Skipping port configuration."
-        notice "Please manually open port ${DATA_PORT} if a firewall is installed."
     fi
 }
 
@@ -176,15 +219,15 @@ setup_firewall() {
 
 install_node_exporter() {
     msg "\n${BOLD}Starting Node Exporter Installation...${COLOR_RESET}"
+    check_root
+    check_dependencies
 
-    # Stop and remove any previous installation to ensure a clean state.
-    if command -v "$BINARY_PATH" &>/dev/null; then
+    if command -v "$BINARY_PATH" &>/dev/null || [[ -f "$SERVICE_FILE" ]]; then
         notice "Previous installation detected. Removing it first."
         remove_node_exporter
         msg "\n--- Continuing with new installation ---"
     fi
 
-    check_dependencies
     setup_user_and_group
     download_and_install_binary
     create_systemd_service
@@ -193,7 +236,6 @@ install_node_exporter() {
     setup_firewall
 
     msg "--- Enabling and starting Node Exporter service ---"
-    # --now enables and starts the service in one command.
     systemctl enable --now "${SERVICE_USER}"
 
     success "Node Exporter has been installed and started!"
@@ -203,14 +245,16 @@ install_node_exporter() {
 
 remove_node_exporter() {
     msg "\n${BOLD}Starting Node Exporter Removal...${COLOR_RESET}"
+    check_root
 
     if [[ -f "$SERVICE_FILE" ]]; then
-        msg "--- Stopping and disabling service ---"
+        msg "--- Stopping and disabling service (${SERVICE_USER}) ---"
         systemctl stop "${SERVICE_USER}" || true
         systemctl disable "${SERVICE_USER}" || true
+    else
+        notice "Service file ${SERVICE_FILE} not found. Skipping service stop."
     fi
 
-    # --- Remove firewall rules ---
     if systemctl is-active --quiet firewalld; then
         msg "--- Removing firewalld rule for port ${DATA_PORT}/tcp ---"
         firewall-cmd --permanent --remove-port=${DATA_PORT}/tcp --quiet || true
@@ -224,26 +268,38 @@ remove_node_exporter() {
     rm -f "$SERVICE_FILE" "$BINARY_PATH"
     systemctl daemon-reload
     userdel "$SERVICE_USER" >/dev/null 2>&1 || true
-    groupdel "$SERVICE_GROUP" >/dev/null 2>&1 || true
+    if [[ "$SERVICE_GROUP" == "$SERVICE_USER" ]]; then
+       groupdel "$SERVICE_GROUP" >/dev/null 2>&1 || true
+    fi
 
     success "Node Exporter has been completely removed."
 }
 
-# --- Print usage instructions ---
 show_help() {
     cat <<EOF
 ${BOLD}Node Exporter Management Script${COLOR_RESET}
 
-This script installs or removes the Prometheus Node Exporter.
-It must be run with root privileges for installation and removal.
+This script installs or removes the Prometheus Node Exporter on Linux systems.
+It automatically detects the platform architecture and prompts to install missing
+dependencies.
 
 ${BOLD}USAGE:${COLOR_RESET}
-  sudo $0 [command]
+  sudo $0 [command] [options]
 
 ${BOLD}COMMANDS:${COLOR_RESET}
-  --install     Installs and starts the Node Exporter service.
-  --remove      Stops and completely removes the Node Exporter.
-  --help        Displays this help message.
+  --install              Installs and starts the Node Exporter service.
+  --remove               Stops and completely removes the Node Exporter.
+  --help                 Displays this help message.
+
+${BOLD}OPTIONS:${COLOR_RESET}
+  --user <name>          Set the service user. Defaults to 'node_exporter'.
+  --group <name>         Set the service group. Defaults to 'node_exporter'.
+  --port <number>        Set the data port. Defaults to '9100'.
+
+${BOLD}EXAMPLES:${COLOR_RESET}
+  sudo $0 --install
+  sudo $0 --install --port 9900 --user web_metrics
+  sudo $0 --remove --user web_metrics
 
 EOF
 }
@@ -252,30 +308,55 @@ EOF
 # --- SCRIPT ENTRYPOINT ---
 #==============================================================================
 main() {
-    # If no arguments are provided, show help.
-    if [[ $# -eq 0 ]]; then
-        show_help
-        exit 1
-    fi
+    detect_platform_arch
+    local action=""
 
-    # Parse command-line arguments.
-    case "$1" in
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --install|--remove)
+                [[ -n "$action" ]] && fatal "Only one action (--install or --remove) can be specified."
+                action="$1"
+                shift
+                ;;
+            --user)
+                [[ -z "${2-}" ]] && fatal "Argument missing for --user."
+                SERVICE_USER="$2"
+                shift 2
+                ;;
+            --group)
+                [[ -z "${2-}" ]] && fatal "Argument missing for --group."
+                SERVICE_GROUP="$2"
+                shift 2
+                ;;
+            --port)
+                [[ -z "${2-}" ]] && fatal "Argument missing for --port."
+                DATA_PORT="$2"
+                shift 2
+                ;;
+            --help)
+                show_help
+                exit 0
+                ;;
+            *)
+                fatal "Invalid argument: $1. Use --help to see available options."
+                ;;
+        esac
+    done
+
+    # Set the service file path now that user might have been customized
+    SERVICE_FILE="/etc/systemd/system/${SERVICE_USER}.service"
+
+    case "$action" in
         --install)
-            check_root
             install_node_exporter
             ;;
         --remove)
-            check_root
             remove_node_exporter
             ;;
-        --help)
-            show_help
-            ;;
         *)
-            fatal "Invalid argument: $1. Use --help to see available options."
+            fatal "No action specified. Please use --install or --remove. Use --help for more details."
             ;;
     esac
 }
 
-# Pass all script arguments to the main function.
 main "$@"
