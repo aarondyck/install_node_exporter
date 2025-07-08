@@ -8,10 +8,10 @@
 # of the correct user, group, and firewall port.
 #
 # Usage:
-#   sudo ./script.sh                (Defaults to --install)
-#   sudo ./script.sh --install --user custom --port 9900
-#   sudo ./script.sh --remove --user custom  (Will find port 9900 automatically)
-#   ./script.sh --help
+#   sudo ./instal_ne.sh                (Defaults to --install)
+#   sudo ./instal_ne.sh --install --user custom --port 9900
+#   sudo ./instal_ne.sh --remove --user custom  (Will find port 9900 automatically)
+#   ./instal_ne.sh --help
 # ==============================================================================
 
 # --- Strict Mode & Error Handling ---
