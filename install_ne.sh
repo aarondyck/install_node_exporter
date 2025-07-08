@@ -94,7 +94,7 @@ check_root() {
 check_dependencies() {
     msg "--- Checking for required packages ---"
     local missing_packages=()
-    local dependencies=("curl" "tar" "jq" "grep" "sed")
+    local dependencies=("curl" "tar" "jq" "grep" "sed" "wget")
 
     for dep in "${dependencies[@]}"; do
         if ! command -v "$dep" &>/dev/null; then
